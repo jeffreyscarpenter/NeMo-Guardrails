@@ -134,13 +134,34 @@ def get_task_model(config: RailsConfig, task: Union[str, Task]) -> Model:
     # Fetch current task parameters like name, models to use, and the prompting mode
     task_name = str(task.value) if isinstance(task, Task) else task
 
+    # 1. If the task explicitly specifies a `$model=` parameter (e.g.
+    #    "content_safety_check_input $model=content_safety"), respect that.
+    specified_model_type = None
+    if "$model=" in task_name:
+        # Everything after $model= until the first whitespace (or end of string)
+        specified_model_type = (
+            task_name.split("$model=")[1]
+            .strip()  # remove leading/trailing whitespace
+            .strip("\"'")  # and potential quotes
+        )
+
     if config.models:
+        # 1.a If an explicit model type was provided, try to use it first.
+        if specified_model_type:
+            _models = [m for m in config.models if m.type == specified_model_type]
+            if _models:
+                return _models[0]
+
+        # 2. Otherwise fall back to a model whose type == the whole task name (legacy
+        #    behaviour for customised tasks).
         _models = [model for model in config.models if model.type == task_name]
         if not _models:
             _models = [model for model in config.models if model.type == "main"]
 
-        return _models[0]
+        if _models:
+            return _models[0]
 
+    # Fallback: no appropriate model found.
     return None
 
 
