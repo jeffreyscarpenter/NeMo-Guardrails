@@ -75,23 +75,29 @@ models:
 
 The meaning of the attributes is as follows:
 
-- `type`: is set to "main" indicating the main LLM model.
-- `engine`: the LLM provider, e.g., `openai`, `huggingface_endpoint`, `self_hosted`, etc.
-- `model`: the name of the model, e.g., `gpt-3.5-turbo-instruct`.
-- `parameters`: any additional parameters, e.g., `temperature`, `top_k`, etc.
+- `type`: is set to _main_ to indicate the model is the application LLM.
+- `engine`: the LLM provider, such as `openai`, `huggingface_endpoint`, `self_hosted`, and so on.
+- `model`: the name of the model, such as `gpt-3.5-turbo-instruct`.
+- `parameters`: arguments to pass to the LangChain class used by the LLM provider.
+  For example, when `engine` is set to `openai`, the toolkit loads the `ChatOpenAI` class.
+  The [ChatOpenAI class](https://python.langchain.com/api_reference/openai/chat_models/langchain_openai.chat_models.base.ChatOpenAI.html)
+  supports `temperature`, `max_tokens`, and other class-specific arguments.
 
 #### Supported LLM Providers
 
-You can use any LLM provider that is supported by LangChain, e.g., `ai21`, `aleph_alpha`, `anthropic`, `anyscale`, `azure`, `cohere`, `huggingface_endpoint`, `huggingface_hub`, `openai`, `self_hosted`, `self_hosted_hugging_face`. Check out the LangChain official documentation for the full list.
+You can use any LLM provider that is supported by LangChain, such as `ai21`, `aleph_alpha`, `anthropic`, `anyscale`, `azure`, `cohere`, `huggingface_endpoint`, `huggingface_hub`, `openai`, `self_hosted`, `self_hosted_hugging_face`. Check out the LangChain official documentation for the full list.
 
-In addition to the above LangChain providers, connecting to [Nvidia NIMs](https://docs.nvidia.com/nim/index.html) is supported using the engine `nvidia_ai_endpoints` or synonymously `nim`, for both Nvidia hosted NIMs (accessible through an Nvidia AI Enterprise license) and for locally downloaded and elf-hosted NIM containers.
+In addition to the above LangChain providers, connecting to [NVIDIA NIM microservices](https://docs.nvidia.com/nim/index.html) is supported using the `nim` engine.
+The `nvidia_ai_endpoints` engine is an alias for the `nim` engine.
+The engine provides access to locally-deployed NIM microservices or NVIDIA hosted models that you can view from <https://build.nvidia.com/models>.
 
-```{note}
-To use any of the providers, you must install additional packages; when you first try to use a configuration with a new provider, you typically receive an error from LangChain that instructs which packages you should install.
-```
+To use any of the LLM providers, you must install the LangChain package for the provider.
+When you first try to use a configuration with a new provider, you typically receive an error from LangChain that instructs which packages you should install.
 
 ```{important}
-Although you can instantiate any of the previously mentioned LLM providers, depending on the capabilities of the model, the NeMo Guardrails toolkit works better with some providers than others. The toolkit includes prompts that have been optimized for certain types of models, such as models provided by`openai` or `llama3` models. For others, you can optimize the prompts yourself following the information in the [LLM Prompts](#llm-prompts) section.
+Although you can instantiate any of the previously mentioned LLM providers, depending on the capabilities of the model, the NeMo Guardrails toolkit works better with some providers than others.
+The toolkit includes prompts that have been optimized for certain types of models, such as models provided by `openai` or `llama3` models.
+For others, you can optimize the prompts yourself following the information in the [LLM Prompts](#llm-prompts) section.
 ```
 
 #### Exploring Available Providers
@@ -113,14 +119,14 @@ For more details about the command and its usage, see the [CLI documentation](..
 
 #### Using LLMs with Reasoning Traces
 
-By default, reasoning models, such as [DeepSeek-R1](https://huggingface.co/collections/deepseek-ai/deepseek-r1-678e1e131c0169c0bc89728d), include the reasoning traces in the model response.
-DeepSeek models use `<think>` and `</think>` as tokens to identify the traces.
+By default, reasoning models, such as [DeepSeek-R1](https://huggingface.co/collections/deepseek-ai/deepseek-r1-678e1e131c0169c0bc89728d) and [NVIDIA Llama 3.1 Nemotron Ultra 253B V1](https://build.nvidia.com/nvidia/llama-3_1-nemotron-ultra-253b-v1), can include the reasoning traces in the model response.
+DeepSeek and the Nemotron family of models use `<think>` and `</think>` as tokens to identify the traces.
 
-The reasoning traces and the tokens usually interfere with NeMo Guardrails and result in falsely triggering output guardrails for safe responses.
+The reasoning traces and the tokens can interfere with NeMo Guardrails and result in falsely triggering output guardrails for safe responses.
 To use these reasoning models, you can remove the traces and tokens from the model response with a configuration like the following example.
 
 ```{code-block} yaml
-:emphasize-lines: 5-
+:emphasize-lines: 5-8, 13-
 
 models:
   - type: main
@@ -130,16 +136,148 @@ models:
       remove_reasoning_traces: True
       start_token: "<think>"
       end_token: "</think>"
+
+  - type: main
+    engine: nim
+    model: nvidia/llama-3.1-nemotron-ultra-253b-v1
+    reasoning_config:
+      remove_reasoning_traces: True
+
+rails:
+  output:
+    apply_to_reasoning_traces: False
+```
+
+```{list-table}
+:header-rows: 1
+
+* - Field
+  - Description
+  - Default Value
+
+* - `reasoning_config.remove_reasoning_traces`
+  - When set to `True`, reasoning traces are omitted from internal tasks.
+  - `True`
+
+* - `reasoning_config.start_token`
+  - Specifies the start token for the reasoning trace.
+  - `<think>`
+
+* - `reasoning_config.end_token`
+  - Specifies the end token for the reasoning trace.
+  - `</think>`
+
+* - `rails.output.apply_to_reasoning_traces`
+  - When set to `True`, output rails are always applied to the reasoning traces and the model response.
+    The value of `remove_reasoning_traces` is ignored when this field is set to `True`.
+
+    By default, output rails are applied to the text of the model response only.
+  - `False`
 ```
 
 The `reasoning_config` field for a model specifies the required configuration for a reasoning model that returns reasoning traces.
 By removing the traces, the guardrails runtime processes only the actual responses from the LLM.
 
-You can specify the following parameters for a reasoning model:
+The following table summarizes the interaction between the `remove_reasoning_traces` and `apply_to_reasoning_traces` values:
 
-- `remove_reasoning_traces`: if the reasoning traces should be ignored (default `True`).
-- `start_token`: the start token for the reasoning process (default `<think>`).
-- `end_token`: the end token for the reasoning process (default `</think>`).
+```{list-table}
+:header-rows: 1
+
+* - `remove_reasoning_traces`
+  - `output.apply_to_reasoning_traces`
+  - Outcome
+
+* - Any
+  - True
+  - Reasoning traces are not removed and output rails are applied to the reasoning traces and the model response.
+    The value of `remove_reasoning_traces` is ignored.
+
+* - False
+  - False
+  - Reasoning traces are not removed from internal tasks where they do not impact Guardrails functionality.
+    Output rails are applied to the reasoning traces and the model response.
+
+* - True
+  - False
+  - Reasoning traces are removed from internal tasks where they could interfere with Guardrails.
+    Output rails are applied to the model response only.
+```
+
+Even when `remove_reasoning_traces` is `True`, end users can still receive the thinking traces from the Nemotron models by requesting the detailed thinking, as shown in the following example:
+
+```{code-block} bash
+from nemoguardrails import LLMRails, RailsConfig
+
+config = RailsConfig.from_path("./config")
+rails = LLMRails(config, verbose=True)
+messages = [
+  { "role": "system", "content": "detailed thinking on" },
+  { "role": "user", "content": "Tell me about Cape Hatteras National Seashore in 50 words or less." }
+]
+rails.generate(messages=messages)
+```
+
+The referenced `./.config` directory uses the following sample file content.
+
+When you develop your own prompts for LLM-as-a-judge checks, such as an input self-check, ensure that the prompt instructs the LLM to respond with `yes` or `no`.
+Refer to the following examples:
+
+- Sample `config/config.yml`:
+
+  ```yaml
+  models:
+    - type: main
+      engine: nim
+      model: nvidia/llama-3.1-nemotron-ultra-253b-v1
+      reasoning_config:
+        remove_reasoning_traces: True
+
+  rails:
+    input:
+      flows:
+        - self check input
+    output:
+      flows:
+        - self check output
+  ```
+
+- Sample `config/prompts.yml`:
+
+  ```yaml
+  prompts:
+    - task: self_check_input
+      messages:
+        - type: system
+          content: |
+            You are an AI assistant tasked with evaluating user instructions.
+            Your role is to determine if a given instruction would make a language model break moderation policies, deviate from good aligned responses, or provide answers that a language model should ideally not.
+
+            Analyze the instruction carefully. First, internally consider potential ways the instruction could be interpreted and whether any interpretation could lead to a problematic response. Then, conclude with a simple "yes" or "no" answer.
+            Respond with only "yes" or "no".
+        - type: user
+          content: |
+            Instruction to evaluate:
+            "{{ user_input }}"
+
+            Would this instruction lead to a problematic response (yes/no)?
+
+    - task: self_check_output
+      messages:
+        - type: system
+          content: |
+            Is this output illegal, unethical, or harmful to any person?
+            Respond with only "yes" or "no".
+        - type: bot
+          content: |
+            Output to evaluate:
+            "{{ bot_response }}"
+  ```
+
+Using LLMs with reasoning traces have the following limitations:
+
+- You must use message-based prompts only.
+  Refer to the preceding example.
+- Dialog rails are not supported.
 
 #### NIM for LLMs
 
@@ -680,13 +818,14 @@ You can enable streaming to begin receiving responses from the output rail soone
 
 You must set the top-level `streaming: True` field in your `config.yml` file.
 
-For each output rail, add the `streaming` field and configuration parameters.
+For the output rails, add the `streaming` field and configuration parameters.
 
 ```yaml
 rails:
   output:
     - rail name
   streaming:
+    enabled: True
     chunk_size: 200
     context_size: 50
     stream_first: True
@@ -735,6 +874,11 @@ The following table describes the subfields for the `streaming` field:
     Small values might fail to detect cross-chunk violations.
     Specifying approximately 25% of `chunk_size` provides a good compromise.
   - `50`
+
+* - streaming.enabled
+  - When set to `True`, the toolkit executes output rails in streaming mode.
+
+  - `False`
 
 * - streaming.stream_first
   - When set to `False`, the toolkit applies the output rails to the chunks before streaming them to the client.
@@ -797,7 +941,7 @@ rails:
 
 On a typical RAG (Retrieval Augmented Generation) scenario, using this option brings a 3x improvement in terms of latency and uses 37% fewer tokens.
 
-**IMPORTANT**: currently, the *Single Call Mode* can only predict bot messages as next steps. This means that if you want the LLM to generalize and decide to execute an action on a dynamically generated user canonical form message, it will not work.
+**IMPORTANT**: currently, the _Single Call Mode_ can only predict bot messages as next steps. This means that if you want the LLM to generalize and decide to execute an action on a dynamically generated user canonical form message, it will not work.
 
 #### Embeddings Only
 
@@ -889,216 +1033,54 @@ When the `self check input` rail is triggered, the following exception is return
 
 ## Tracing
 
-NeMo Guardrails includes a tracing feature that allows you to monitor and log interactions for better observability and debugging. Tracing can be easily configured via the existing `config.yml` file. Below are the steps to enable and configure tracing in your project.
+NeMo Guardrails includes tracing capabilities to monitor and debug your guardrails interactions. Tracing helps you understand:
 
-### Enabling Tracing
+- Which rails are activated during conversations
+- LLM call patterns and performance
+- Flow execution paths and timing
+- Error conditions and debugging information
 
-To enable tracing, set the enabled flag to true under the tracing section in your `config.yml`:
+### Basic Configuration
+
+Enable tracing in your `config.yml`:
 
 ```yaml
 tracing:
   enabled: true
+  adapters:
+    - name: FileSystem
+      filepath: "./logs/traces.jsonl"
+```
+
+This configuration logs traces to local JSON files, which is suitable for development and debugging.
+
+### OpenTelemetry Integration
+
+For production environments and integration with observability platforms:
+
+```yaml
+tracing:
+  enabled: true
+  adapters:
+    - name: OpenTelemetry
 ```
 
 ```{important}
-You must install the necessary dependencies to use tracing adapters.
-
-```sh
-  pip install "opentelemetry-api opentelemetry-sdk aiofiles"
+Install tracing dependencies: `pip install nemoguardrails[tracing]`
 ```
 
-### Configuring Tracing Adapters
-
-Tracing supports multiple adapters that determine how and where the interaction logs are exported. You can configure one or more adapters by specifying them under the adapters list. Below are examples of configuring the built-in `OpenTelemetry` and `FileSystem` adapters:
-
-```yaml
-tracing:
-  enabled: true
-  adapters:
-    - name: OpenTelemetry
-      service_name: "nemo_guardrails_service"
-      exporter: "console"  # Options: "console", "zipkin", etc.
-      resource_attributes:
-        env: "production"
-    - name: FileSystem
-      filepath: './traces/traces.jsonl'
+```{note}
+OpenTelemetry integration requires configuring the OpenTelemetry SDK in your application code. NeMo Guardrails follows OpenTelemetry best practices where libraries use only the API and applications configure the SDK. See the [Tracing Guide](tracing.md) for detailed setup instructions and examples.
 ```
 
-```{warning}
-The "console" is intended for debugging and demonstration purposes only and should not be used in production environments. Using this exporter will output tracing information directly to the console, which can interfere with application output, distort the user interface, degrade performance, and potentially expose sensitive information. For production use, please configure a suitable exporter that sends tracing data to a dedicated backend or monitoring system.
-```
+### Configuration Options
 
-#### OpenTelemetry Adapter
+| Adapter | Use Case | Configuration |
+|---------|----------|---------------|
+| FileSystem | Development, debugging, simple logging | `filepath: "./logs/traces.jsonl"` |
+| OpenTelemetry | Production, monitoring platforms, distributed systems | Requires application-level SDK configuration |
 
-The `OpenTelemetry` adapter integrates with the OpenTelemetry framework, allowing you to export traces to various backends. Key configuration options include:
-
- • `service_name`: The name of your service.
- • `exporter`: The type of exporter to use (e.g., console, zipkin).
- • `resource_attributes`: Additional attributes to include in the trace resource (e.g., environment).
-
-#### FileSystem Adapter
-
-The  `FileSystem`  adapter exports interaction logs to a local JSON Lines file. Key configuration options include:
-
- • `filepath`: The path to the file where traces will be stored. If not specified, it defaults to `./.traces/trace.jsonl`.
-
-### Example Configuration
-
-Below is a comprehensive example of a `config.yml` file with both `OpenTelemetry` and `FileSystem` adapters enabled:
-
-```yaml
-tracing:
-  enabled: true
-  adapters:
-    - name: OpenTelemetry
-      service_name: "nemo_guardrails_service"
-      exporter: "zipkin"
-      resource_attributes:
-        env: "production"
-    - name: FileSystem
-      filepath: './traces/traces.jsonl'
-```
-
-To use this configuration, you must ensure that Zipkin is running locally or is accessible via the network.
-
-#### Using Zipkin as an Exporter
-
-To use `Zipkin` as an exporter, follow these steps:
-
-1. Install the Zipkin exporter for OpenTelemetry:
-
-    ```sh
-    pip install opentelemetry-exporter-zipkin
-    ```
-
-2. Run the `Zipkin` server using Docker:
-
-    ```sh
-    docker run -d -p 9411:9411 openzipkin/zipkin
-    ```
-
-### Registering OpenTelemetry Exporters
-
-You can also use other [OpenTelemetry exporters](https://opentelemetry.io/ecosystem/registry/?component=exporter&language=python) by registering them in the `config.py` file. To do so you need to use `register_otel_exporter` and register the exporter class.Below is an example of registering the `Jaeger` exporter:
-
-```python
-# This assumes that Jaeger exporter is installed
-# pip install opentelemetry-exporter-jaeger
-
-from opentelemetry.exporter.jaeger.thrift import JaegerExporter
-from nemoguardrails.tracing.adapters.opentelemetry import register_otel_exporter
-
-register_otel_exporter(JaegerExporter, "jaeger")
-
-  ```
-
-Then you can use it in the `config.yml` file as follows:
-
-```yaml
-
-tracing:
-  enabled: true
-  adapters:
-    - name: OpenTelemetry
-      service_name: "nemo_guardrails_service"
-      exporter: "jaeger"
-      resource_attributes:
-        env: "production"
-
-```
-
-### Custom InteractionLogAdapters
-
-NeMo Guardrails allows you to extend its tracing capabilities by creating custom `InteractionLogAdapter` classes. This flexibility enables you to transform and export interaction logs to any backend or format that suits your needs.
-
-#### Implementing a Custom Adapter
-
-To create a custom adapter, you need to implement the `InteractionLogAdapter` abstract base class. Below is the interface you must follow:
-
-```python
-from abc import ABC, abstractmethod
-from nemoguardrails.tracing import InteractionLog
-
-class InteractionLogAdapter(ABC):
-    name: Optional[str] = None
-
-
-    @abstractmethod
-    async def transform_async(self, interaction_log: InteractionLog):
-        """Transforms the InteractionLog into the backend-specific format asynchronously."""
-        raise NotImplementedError
-
-    async def close(self):
-        """Placeholder for any cleanup actions if needed."""
-        pass
-
-    async def __aenter__(self):
-        """Enter the runtime context related to this object."""
-        return self
-
-    async def __aexit__(self, exc_type, exc_value, traceback):
-        """Exit the runtime context related to this object."""
-        await self.close()
-
-```
-
-#### Registering Your Custom Adapter
-
-After implementing your custom adapter, you need to register it so that NemoGuardrails can recognize and utilize it. This is done by adding a registration call in your `config.py:`
-
-```python
-from nemoguardrails.tracing.adapters.registry import register_log_adapter
-from path.to.your.adapter import YourCustomAdapter
-
-register_log_adapter(YourCustomAdapter, "CustomLogAdapter")
-```
-
-#### Example: Creating a Custom Adapter
-
-Here's a simple example of a custom adapter that logs interaction logs to a custom backend:
-
-```python
-from nemoguardrails.tracing.adapters.base import InteractionLogAdapter
-from nemoguardrails.tracing import InteractionLog
-
-class MyCustomLogAdapter(InteractionLogAdapter):
-    name = "MyCustomLogAdapter"
-
-    def __init__(self, custom_option1: str, custom_option2: str):
-      self.custom_option1 = custom_option1
-      self.custom_option2 = custom
-
-    def transform(self, interaction_log: InteractionLog):
-        # Implement your transformation logic here
-        custom_format = convert_to_custom_format(interaction_log)
-        send_to_custom_backend(custom_format)
-
-    async def transform_async(self, interaction_log: InteractionLog):
-        # Implement your asynchronous transformation logic here
-        custom_format = convert_to_custom_format(interaction_log)
-        await send_to_custom_backend_async(custom_format)
-
-    async def close(self):
-        # Implement any necessary cleanup here
-        await cleanup_custom_resources()
-
-```
-
-Updating `config.yml` with Your `CustomLogAdapter`
-
-Once registered, you can configure your custom adapter in the `config.yml` like any other adapter:
-
-```yaml
-tracing:
-  enabled: true
-  adapters:
-    - name: MyCustomLogAdapter
-      custom_option1: "value1"
-      custom_option2: "value2"
-
-```
-
-By following these steps, you can leverage the built-in tracing adapters or create and integrate your own custom adapters to enhance the observability of your NeMo Guardrails powered applications. Whether you choose to export logs to the filesystem, integrate with OpenTelemetry, or implement a bespoke logging solution, tracing provides the flexibility to meet your requirements.
+For advanced configuration, custom adapters, and production deployment examples, see the [detailed tracing guide](tracing.md).
 
 ## Knowledge base Documents
 

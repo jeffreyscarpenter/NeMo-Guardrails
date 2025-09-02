@@ -47,13 +47,14 @@ exclude_patterns = [
 ]
 
 myst_linkify_fuzzy_links = False
-myst_heading_anchors = 3
+myst_heading_anchors = 4
 myst_enable_extensions = [
     "deflist",
     "dollarmath",
     "fieldlist",
     "substitution",
 ]
+myst_links_external_new_tab = True
 
 myst_substitutions = {
     "version": release,
@@ -62,6 +63,15 @@ myst_substitutions = {
 exclude_patterns = [
     "_build/**",
 ]
+
+myst_url_schemes = {
+    "http": None,
+    "https": None,
+    "pr": {
+        "url": "https://github.com/NVIDIA/NeMo-Guardrails/pull/{{path}}",
+        "title": "PR #{{path}}",
+    },
+}
 
 # intersphinx_mapping = {
 #     'gpu-op': ('https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest', None),

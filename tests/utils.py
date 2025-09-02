@@ -35,14 +35,51 @@ from nemoguardrails.colang.v2_x.runtime.runtime import (
 from nemoguardrails.colang.v2_x.runtime.statemachine import initialize_state
 from nemoguardrails.utils import EnhancedJsonEncoder, new_event_dict, new_uuid
 
+# test providers that are known to support token usage reporting during streaming
+# use this to simulate realistic behavior in tests: providers in this list will
+# return token usage data when stream_usage=True is passed, others won't.
+_TEST_PROVIDERS_WITH_TOKEN_USAGE_SUPPORT = ["openai", "azure_openai", "nim"]
+
 
 class FakeLLM(LLM):
     """Fake LLM wrapper for testing purposes."""
 
     responses: List
-    i: int = 0
     streaming: bool = False
     exception: Optional[Exception] = None
+    token_usage: Optional[List[Dict[str, int]]] = None  # Token usage per response
+    should_enable_stream_usage: bool = False
+    _shared_state: Optional[Dict] = None  # Shared state for isolated copies
+
+    def __init__(self, **kwargs):
+        """Initialize FakeLLM."""
+        # Extract initial counter value before parent init
+        initial_i = kwargs.pop("i", 0)
+        super().__init__(**kwargs)
+        # If no shared state, create one with initial counter
+        if self._shared_state is None:
+            self._shared_state = {"counter": initial_i}
+
+    def __copy__(self):
+        """Create a shallow copy that shares state with the original."""
+        new_instance = self.__class__.__new__(self.__class__)
+        new_instance.__dict__.update(self.__dict__)
+        # Share the same state dict so counter is synchronized
+        new_instance._shared_state = self._shared_state
+        return new_instance
+
+    @property
+    def i(self) -> int:
+        """Get current counter value from shared state."""
+        if self._shared_state:
+            return self._shared_state["counter"]
+        return 0
+
+    @i.setter
+    def i(self, value: int):
+        """Set counter value in shared state."""
+        if self._shared_state:
+            self._shared_state["counter"] = value
 
     @property
     def _llm_type(self) -> str:
@@ -60,14 +97,15 @@ class FakeLLM(LLM):
         if self.exception:
             raise self.exception
 
-        if self.i >= len(self.responses):
+        current_i = self.i
+        if current_i >= len(self.responses):
             raise RuntimeError(
-                f"No responses available for query number {self.i + 1} in FakeLLM. "
+                f"No responses available for query number {current_i + 1} in FakeLLM. "
                 "Most likely, too many LLM calls are made or additional responses need to be provided."
             )
 
-        response = self.responses[self.i]
-        self.i += 1
+        response = self.responses[current_i]
+        self.i = current_i + 1
         return response
 
     async def _acall(
@@ -81,14 +119,15 @@ class FakeLLM(LLM):
         if self.exception:
             raise self.exception
 
-        if self.i >= len(self.responses):
+        current_i = self.i
+        if current_i >= len(self.responses):
             raise RuntimeError(
-                f"No responses available for query number {self.i + 1} in FakeLLM. "
+                f"No responses available for query number {current_i + 1} in FakeLLM. "
                 "Most likely, too many LLM calls are made or additional responses need to be provided."
             )
 
-        response = self.responses[self.i]
-        self.i += 1
+        response = self.responses[current_i]
+        self.i = current_i + 1
 
         if self.streaming and run_manager:
             # To mock streaming, we just split in chunk by spaces
@@ -103,6 +142,46 @@ class FakeLLM(LLM):
                 await run_manager.on_llm_new_token(token=chunk, chunk=chunk)
 
         return response
+
+    def _get_token_usage_for_response(
+        self, response_index: int, kwargs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Get token usage data for the given response index if conditions are met."""
+
+        llm_output = {}
+        if (
+            self.token_usage
+            and response_index >= 0
+            and response_index < len(self.token_usage)
+            and (kwargs.get("stream_usage", False) or self.should_enable_stream_usage)
+        ):
+            llm_output = {"token_usage": self.token_usage[response_index]}
+        return llm_output
+
+    def _generate(self, prompts, stop=None, run_manager=None, **kwargs):
+        """Override _generate to provide token usage in LLMResult."""
+
+        from langchain.schema import Generation, LLMResult
+
+        generations = [
+            [Generation(text=self._call(prompt, stop, run_manager, **kwargs))]
+            for prompt in prompts
+        ]
+
+        llm_output = self._get_token_usage_for_response(self.i - 1, kwargs)
+        return LLMResult(generations=generations, llm_output=llm_output)
+
+    async def _agenerate(self, prompts, stop=None, run_manager=None, **kwargs):
+        """Override _agenerate to provide token usage in LLMResult."""
+        from langchain.schema import Generation, LLMResult
+
+        generations = [
+            [Generation(text=await self._acall(prompt, stop, run_manager, **kwargs))]
+            for prompt in prompts
+        ]
+
+        llm_output = self._get_token_usage_for_response(self.i - 1, kwargs)
+        return LLMResult(generations=generations, llm_output=llm_output)
 
     @property
     def _identifying_params(self) -> Mapping[str, Any]:
@@ -131,24 +210,42 @@ class TestChat:
 
     def __init__(
         self,
-        config: RailsConfig,
+        config: Union[str, RailsConfig],
         llm_completions: Optional[List[str]] = None,
         streaming: bool = False,
         llm_exception: Optional[Exception] = None,
+        token_usage: Optional[List[Dict[str, int]]] = None,
     ):
         """Creates a TestChat instance.
 
-        If a set of LLM completions are specified, a FakeLLM instance will be used.
-
-        Args
-            config: The rails configuration that should be used.
+        Args:
+            config: The Rails configuration
             llm_completions: The completions that should be generated by the fake LLM.
             streaming: Whether to simulate streaming responses.
             llm_exception: An exception to be raised by the LLM (for testing error handling).
+            token_usage: Optional token usage data to simulate stream_usage=True behavior.
         """
         self.llm = None
         if llm_completions is not None:
-            self.llm = FakeLLM(responses=llm_completions, streaming=streaming)
+            # check if we should simulate stream_usage=True behavior
+            # this mirrors the logic in LLMRails._prepare_model_kwargs
+            should_enable_stream_usage = False
+            if config.streaming:
+                main_model = next(
+                    (model for model in config.models if model.type == "main"), None
+                )
+                if (
+                    main_model
+                    and main_model.engine in _TEST_PROVIDERS_WITH_TOKEN_USAGE_SUPPORT
+                ):
+                    should_enable_stream_usage = True
+
+            self.llm = FakeLLM(
+                responses=llm_completions,
+                streaming=streaming,
+                token_usage=token_usage,
+                should_enable_stream_usage=should_enable_stream_usage,
+            )
             if llm_exception:
                 self.llm.exception = llm_exception
 

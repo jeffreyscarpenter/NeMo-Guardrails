@@ -25,7 +25,8 @@ import yaml
 from pydantic import (
     BaseModel,
     ConfigDict,
-    ValidationError,
+    Field,
+    SecretStr,
     model_validator,
     root_validator,
     validator,
@@ -77,7 +78,7 @@ class ReasoningModelConfig(BaseModel):
     )
     remove_thinking_traces: Optional[bool] = Field(
         default=None,
-        description="[DEPRECATED] Use remove_reasoning_traces instead. For reasoning models (e.g. DeepSeek-r1), if the output parser should remove thinking traces.",
+        deprecated="The `remove_thinking_traces` field is deprecated use remove_reasoning_traces instead.",
     )
     start_token: Optional[str] = Field(
         default="<think>",
@@ -89,17 +90,9 @@ class ReasoningModelConfig(BaseModel):
     )
 
     @model_validator(mode="after")
-    def handle_deprecated_field(self) -> "ReasoningModelConfig":
-        """Handle the deprecated remove_thinking_traces field."""
+    def _migrate_thinking_traces(self) -> "ReasoningModelConfig":
+        # If someone uses the old field, propagate it silently
         if self.remove_thinking_traces is not None:
-            import warnings
-
-            warnings.warn(
-                "The 'remove_thinking_traces' field is deprecated and will be removed in 0.15.0 version. "
-                "Please use 'remove_reasoning_traces' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
             self.remove_reasoning_traces = self.remove_thinking_traces
         return self
 
@@ -365,11 +358,28 @@ class LogAdapterConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class SpanFormat(str, Enum):
+    legacy = "legacy"
+    opentelemetry = "opentelemetry"
+
+
 class TracingConfig(BaseModel):
     enabled: bool = False
     adapters: List[LogAdapterConfig] = Field(
         default_factory=lambda: [LogAdapterConfig()],
         description="The list of tracing adapters to use. If not specified, the default adapters are used.",
+    )
+    span_format: str = Field(
+        default=SpanFormat.opentelemetry,
+        description="The span format to use. Options are 'legacy' (simple metrics) or 'opentelemetry' (OpenTelemetry semantic conventions).",
+    )
+    enable_content_capture: bool = Field(
+        default=False,
+        description=(
+            "Capture prompts and responses (user/assistant/tool message content) in tracing/telemetry events. "
+            "Disabled by default for privacy and alignment with OpenTelemetry GenAI semantic conventions. "
+            "WARNING: Enabling this may include PII and sensitive data in your telemetry backend."
+        ),
     )
 
 
@@ -432,6 +442,11 @@ class CoreConfig(BaseModel):
 class InputRails(BaseModel):
     """Configuration of input rails."""
 
+    parallel: Optional[bool] = Field(
+        default=False,
+        description="If True, the input rails are executed in parallel.",
+    )
+
     flows: List[str] = Field(
         default_factory=list,
         description="The names of all the flows that implement input rails.",
@@ -462,6 +477,11 @@ class OutputRailsStreamingConfig(BaseModel):
 class OutputRails(BaseModel):
     """Configuration of output rails."""
 
+    parallel: Optional[bool] = Field(
+        default=False,
+        description="If True, the output rails are executed in parallel.",
+    )
+
     flows: List[str] = Field(
         default_factory=list,
         description="The names of all the flows that implement output rails.",
@@ -472,7 +492,7 @@ class OutputRails(BaseModel):
         description="Configuration for streaming output rails.",
     )
 
-    apply_to_reasoning_traces: bool = Field(
+    apply_to_reasoning_traces: Optional[bool] = Field(
         default=False,
         description=(
             "If True, output rails will apply guardrails to both reasoning traces and output response. "
@@ -564,7 +584,7 @@ class JailbreakDetectionConfig(BaseModel):
 
     server_endpoint: Optional[str] = Field(
         default=None,
-        description="The endpoint for the jailbreak detection heuristics server.",
+        description="The endpoint for the jailbreak detection heuristics/model container.",
     )
     length_per_perplexity_threshold: float = Field(
         default=89.79, description="The length/perplexity threshold."
@@ -572,19 +592,70 @@ class JailbreakDetectionConfig(BaseModel):
     prefix_suffix_perplexity_threshold: float = Field(
         default=1845.65, description="The prefix/suffix perplexity threshold."
     )
+    nim_base_url: Optional[str] = Field(
+        default=None,
+        description="Base URL for jailbreak detection model. Example: http://localhost:8000/v1",
+    )
+    nim_server_endpoint: Optional[str] = Field(
+        default="classify",
+        description="Classification path uri. Defaults to 'classify' for NemoGuard JailbreakDetect.",
+    )
+    api_key: Optional[SecretStr] = Field(
+        default=None,
+        description="Secret String with API key for use in Jailbreak requests. Takes precedence over api_key_env_var",
+    )
+    api_key_env_var: Optional[str] = Field(
+        default=None,
+        description="Environment variable containing API key for jailbreak detection model",
+    )
+    # legacy fields, keep for backward comp with deprecation warnings
     nim_url: Optional[str] = Field(
         default=None,
-        description="Location of the NemoGuard JailbreakDetect NIM.",
+        deprecated="Use 'nim_base_url' instead. This field will be removed in a future version.",
+        description="DEPRECATED: Use nim_base_url instead",
     )
-    nim_port: int = Field(
-        default=8000,
-        description="Port the NemoGuard JailbreakDetect NIM is listening on.",
+    nim_port: Optional[int] = Field(
+        default=None,
+        deprecated="Include port in 'nim_base_url' instead. This field will be removed in a future version.",
+        description="DEPRECATED: Include port in nim_base_url instead",
     )
     embedding: Optional[str] = Field(
-        default="nvidia/nv-embedqa-e5-v5",
-        description="DEPRECATED: Model to use for embedding-based detections. Use NIM instead.",
-        deprecated=True,
+        default=None,
+        deprecated="This field is no longer used.",
     )
+
+    @model_validator(mode="after")
+    def migrate_deprecated_fields(self) -> "JailbreakDetectionConfig":
+        """Migrate deprecated nim_url/nim_port fields to nim_base_url format."""
+        if self.nim_url and not self.nim_base_url:
+            port = self.nim_port or 8000
+            self.nim_base_url = f"http://{self.nim_url}:{port}/v1"
+        return self
+
+    def get_api_key(self) -> Optional[str]:
+        """Helper to return an API key (if it exists) from a Jailbreak configuration.
+          This can come from (in descending order of priority):
+
+        1. The `api_key` field, a Pydantic SecretStr from which we extract the full string.
+        2. The `api_key_env_var` field, a string stored in this environment variable.
+
+        If neither is found, None is returned.
+        """
+
+        if self.api_key:
+            return self.api_key.get_secret_value()
+
+        if self.api_key_env_var:
+            nim_auth_token = os.getenv(self.api_key_env_var)
+            if nim_auth_token:
+                return nim_auth_token
+
+            log.warning(
+                "Specified a value for jailbreak config api_key_env var at %s but the environment variable was not set!"
+                % self.api_key_env_var
+            )
+
+        return None
 
 
 class AutoAlignOptions(BaseModel):
@@ -703,6 +774,62 @@ class ClavataRailConfig(BaseModel):
     )
 
 
+class PangeaRailOptions(BaseModel):
+    """Configuration data for the Pangea AI Guard API"""
+
+    recipe: str = Field(
+        description="""Recipe key of a configuration of data types and settings defined in the Pangea User Console. It
+        specifies the rules that are to be applied to the text, such as defang malicious URLs."""
+    )
+
+
+class PangeaRailConfig(BaseModel):
+    """Configuration data for the Pangea AI Guard API"""
+
+    input: Optional[PangeaRailOptions] = Field(
+        default=None,
+        description="Pangea configuration for an Input Guardrail",
+    )
+    output: Optional[PangeaRailOptions] = Field(
+        default=None,
+        description="Pangea configuration for an Output Guardrail",
+    )
+
+
+class GuardrailsAIValidatorConfig(BaseModel):
+    """Configuration for a single Guardrails AI validator."""
+
+    name: str = Field(
+        description="Unique identifier or import path for the Guardrails AI validator (e.g., 'toxic_language', 'pii', 'regex_match', or 'guardrails/competitor_check')."
+    )
+
+    parameters: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Parameters to pass to the validator during initialization (e.g., threshold, regex pattern).",
+    )
+
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Metadata to pass to the validator during validation (e.g., valid_topics, context).",
+    )
+
+
+class GuardrailsAIRailConfig(BaseModel):
+    """Configuration data for Guardrails AI integration."""
+
+    validators: List[GuardrailsAIValidatorConfig] = Field(
+        default_factory=list,
+        description="List of Guardrails AI validators to apply. Each validator can have its own parameters and metadata.",
+    )
+
+    def get_validator_config(self, name: str) -> Optional[GuardrailsAIValidatorConfig]:
+        """Get a specific validator configuration by name."""
+        for _validator in self.validators:
+            if _validator.name == name:
+                return _validator
+        return None
+
+
 class RailsConfigData(BaseModel):
     """Configuration data for specific rails that are supported out-of-the-box."""
 
@@ -749,6 +876,16 @@ class RailsConfigData(BaseModel):
     clavata: Optional[ClavataRailConfig] = Field(
         default_factory=ClavataRailConfig,
         description="Configuration for Clavata.",
+    )
+
+    pangea: Optional[PangeaRailConfig] = Field(
+        default_factory=PangeaRailConfig,
+        description="Configuration for Pangea.",
+    )
+
+    guardrails_ai: Optional[GuardrailsAIRailConfig] = Field(
+        default_factory=GuardrailsAIRailConfig,
+        description="Configuration for Guardrails AI validators.",
     )
 
 
@@ -1296,12 +1433,13 @@ class RailsConfig(BaseModel):
     @root_validator(pre=True, allow_reuse=True)
     def check_prompt_exist_for_self_check_rails(cls, values):
         rails = values.get("rails", {})
+        prompts = values.get("prompts", []) or []
 
         enabled_input_rails = rails.get("input", {}).get("flows", [])
         enabled_output_rails = rails.get("output", {}).get("flows", [])
         provided_task_prompts = [
             prompt.task if hasattr(prompt, "task") else prompt.get("task")
-            for prompt in values.get("prompts", [])
+            for prompt in prompts
         ]
 
         # Input moderation prompt verification
@@ -1356,7 +1494,7 @@ class RailsConfig(BaseModel):
             # "content_safety_check input $model",
             # "content_safety_check output $model",
         ]
-        prompts = values.get("prompts", [])
+        prompts = values.get("prompts") or []
         for prompt in prompts:
             task = prompt.task if hasattr(prompt, "task") else prompt.get("task")
             output_parser = (
@@ -1424,7 +1562,7 @@ class RailsConfig(BaseModel):
         """
         # If the config path is a file, we load the YAML content.
         # Otherwise, if it's a folder, we iterate through all files.
-        if config_path.endswith(".yaml") or config_path.endswith(".yml"):
+        if os.path.isfile(config_path) and config_path.endswith((".yaml", ".yml")):
             with open(config_path) as f:
                 raw_config = yaml.safe_load(f.read())
 
@@ -1603,12 +1741,12 @@ def _join_rails_configs(
     combined_rails_config_dict = _join_dict(
         base_rails_config.dict(), updated_rails_config.dict()
     )
-    combined_rails_config_dict["config_path"] = ",".join(
-        [
-            base_rails_config.dict()["config_path"],
-            updated_rails_config.dict()["config_path"],
-        ]
-    )
+    # filter out empty strings to avoid leading/trailing commas
+    config_paths = [
+        base_rails_config.dict()["config_path"] or "",
+        updated_rails_config.dict()["config_path"] or "",
+    ]
+    combined_rails_config_dict["config_path"] = ",".join(filter(None, config_paths))
     combined_rails_config = RailsConfig(**combined_rails_config_dict)
     return combined_rails_config
 

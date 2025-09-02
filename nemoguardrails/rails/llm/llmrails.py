@@ -23,12 +23,12 @@ import os
 import re
 import threading
 import time
-import warnings
 from functools import partial
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Type, Union, cast
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.language_models.llms import BaseLLM
+from typing_extensions import Self
 
 from nemoguardrails.actions.llm.generation import LLMGenerationActions
 from nemoguardrails.actions.llm.utils import (
@@ -38,7 +38,7 @@ from nemoguardrails.actions.llm.utils import (
 from nemoguardrails.actions.output_mapping import is_output_blocked
 from nemoguardrails.actions.v2_x.generation import LLMGenerationActionsV2dotx
 from nemoguardrails.colang import parse_colang_file
-from nemoguardrails.colang.v1_0.runtime.flows import compute_context
+from nemoguardrails.colang.v1_0.runtime.flows import _normalize_flow_id, compute_context
 from nemoguardrails.colang.v1_0.runtime.runtime import Runtime, RuntimeV1_0
 from nemoguardrails.colang.v2_x.runtime.flows import Action, State
 from nemoguardrails.colang.v2_x.runtime.runtime import RuntimeV2_x
@@ -51,7 +51,6 @@ from nemoguardrails.context import (
     generation_options_var,
     llm_stats_var,
     raw_llm_request,
-    reasoning_trace_var,
     streaming_handler_var,
 )
 from nemoguardrails.embeddings.index import EmbeddingsIndex
@@ -68,14 +67,17 @@ from nemoguardrails.logging.stats import LLMStats
 from nemoguardrails.logging.verbose import set_verbose
 from nemoguardrails.patch_asyncio import check_sync_call_from_async_loop
 from nemoguardrails.rails.llm.buffer import get_buffer_strategy
-from nemoguardrails.rails.llm.config import EmbeddingSearchProvider, Model, RailsConfig
+from nemoguardrails.rails.llm.config import EmbeddingSearchProvider, RailsConfig
 from nemoguardrails.rails.llm.options import (
     GenerationLog,
     GenerationOptions,
     GenerationResponse,
 )
-from nemoguardrails.rails.llm.utils import get_history_cache_key
-from nemoguardrails.streaming import StreamingHandler
+from nemoguardrails.rails.llm.utils import (
+    get_action_details_from_flow_id,
+    get_history_cache_key,
+)
+from nemoguardrails.streaming import END_OF_STREAM, StreamingHandler
 from nemoguardrails.utils import (
     extract_error_json,
     get_or_create_event_loop,
@@ -105,7 +107,8 @@ class LLMRails:
 
         Args:
             config: A rails configuration.
-            llm: An optional LLM engine to use.
+            llm: An optional LLM engine to use. If provided, this will be used as the main LLM
+                and will take precedence over any main LLM specified in the config.
             verbose: Whether the logging should be verbose or not.
         """
         self.config = config
@@ -241,6 +244,8 @@ class LLMRails:
             from nemoguardrails.tracing import create_log_adapters
 
             self._log_adapters = create_log_adapters(config.tracing)
+        else:
+            self._log_adapters = None
 
         # We run some additional checks on the config
         self._validate_config()
@@ -279,6 +284,8 @@ class LLMRails:
         # We also register the kb as a parameter that can be passed to actions.
         self.runtime.register_action_param("kb", self.kb)
 
+        # detect actions that need isolated LLM instances and create them
+        self._create_isolated_llms_for_actions()
         # Reference to the general ExplainInfo object.
         self.explain_info = None
 
@@ -302,20 +309,14 @@ class LLMRails:
 
         for flow_name in self.config.rails.input.flows:
             # content safety check input/output flows are special as they have parameters
-            if flow_name.startswith("content safety check") or flow_name.startswith(
-                "topic safety check"
-            ):
-                continue
+            flow_name = _normalize_flow_id(flow_name)
             if flow_name not in existing_flows_names:
                 raise ValueError(
                     f"The provided input rail flow `{flow_name}` does not exist"
                 )
 
         for flow_name in self.config.rails.output.flows:
-            if flow_name.startswith("content safety check") or flow_name.startswith(
-                "topic safety check"
-            ):
-                continue
+            flow_name = _normalize_flow_id(flow_name)
             if flow_name not in existing_flows_names:
                 raise ValueError(
                     f"The provided output rail flow `{flow_name}` does not exist"
@@ -350,6 +351,62 @@ class LLMRails:
         self.kb.init()
         await self.kb.build()
 
+    def _prepare_model_kwargs(self, model_config):
+        """
+        Prepare kwargs for model initialization, including API key from environment variable.
+
+        Args:
+            model_config: The model configuration object
+
+        Returns:
+            dict: The prepared kwargs for model initialization
+        """
+        kwargs = model_config.parameters or {}
+
+        # If the optional API Key Environment Variable is set, add it to kwargs
+        if model_config.api_key_env_var:
+            api_key = os.environ.get(model_config.api_key_env_var)
+            if api_key:
+                kwargs["api_key"] = api_key
+
+        # enable streaming token usage when streaming is enabled
+        # providers that don't support this parameter will simply ignore it
+        if self.config.streaming:
+            kwargs["stream_usage"] = True
+
+        return kwargs
+
+    def _configure_main_llm_streaming(
+        self,
+        llm: Union[BaseLLM, BaseChatModel],
+        model_name: Optional[str] = None,
+        provider_name: Optional[str] = None,
+    ):
+        """Configure streaming support for the main LLM.
+
+        Args:
+            llm (Union[BaseLLM, BaseChatModel]): The main LLM model instance.
+            model_name (Optional[str], optional): Optional model name for logging.
+            provider_name (Optional[str], optional): Optional provider name for logging.
+
+        """
+        if not self.config.streaming:
+            return
+
+        if "streaming" in llm.model_fields:
+            llm.streaming = True
+            self.main_llm_supports_streaming = True
+        else:
+            self.main_llm_supports_streaming = False
+            if model_name and provider_name:
+                log.warning(
+                    "Model %s from provider %s does not support streaming.",
+                    model_name,
+                    provider_name,
+                )
+            else:
+                log.warning("Provided main LLM does not support streaming.")
+
     def _init_llms(self):
         """
         Initializes the right LLM engines based on the configuration.
@@ -363,11 +420,46 @@ class LLMRails:
         Raises:
             ModelInitializationError: If any model initialization fails
         """
-        # If we already have a pre-configured one,
-        # we just need to register the LLM as an action param.
-        if self.llm is not None:
+        # If the user supplied an already-constructed LLM via the constructor we
+        # treat it as the *main* model, but **still** iterate through the
+        # configuration to load any additional models (e.g. `content_safety`).
+
+        if self.llm:
+            # If an LLM was provided via constructor, use it as the main LLM
+            # Log a warning if a main LLM is also specified in the config
+            if any(model.type == "main" for model in self.config.models):
+                log.warning(
+                    "Both an LLM was provided via constructor and a main LLM is specified in the config. "
+                    "The LLM provided via constructor will be used and the main LLM from config will be ignored."
+                )
             self.runtime.register_action_param("llm", self.llm)
-            return
+
+            self._configure_main_llm_streaming(self.llm)
+        else:
+            # Otherwise, initialize the main LLM from the config
+            main_model = next(
+                (model for model in self.config.models if model.type == "main"), None
+            )
+
+            if main_model:
+                kwargs = self._prepare_model_kwargs(main_model)
+                self.llm = init_llm_model(
+                    model_name=main_model.model,
+                    provider_name=main_model.engine,
+                    mode="chat",
+                    kwargs=kwargs,
+                )
+                self.runtime.register_action_param("llm", self.llm)
+
+                self._configure_main_llm_streaming(
+                    self.llm,
+                    model_name=main_model.model,
+                    provider_name=main_model.engine,
+                )
+            else:
+                log.warning(
+                    "No main LLM specified in the config and no LLM provided via constructor."
+                )
 
         llms = dict()
 
@@ -375,18 +467,15 @@ class LLMRails:
             if llm_config.type == "embeddings":
                 continue
 
+            # If a constructor LLM is provided, skip initializing any 'main' model from config
+            if self.llm and llm_config.type == "main":
+                continue
+
             try:
                 model_name = llm_config.model
                 provider_name = llm_config.engine
-                kwargs = llm_config.parameters or {}
+                kwargs = self._prepare_model_kwargs(llm_config)
                 mode = llm_config.mode
-
-                # If the optional API Key Environment Variable is set, store
-                # this in the `kwargs` for the current model
-                if llm_config.api_key_env_var:
-                    api_key = os.environ.get(llm_config.api_key_env_var)
-                    if api_key:
-                        kwargs["api_key"] = api_key
 
                 llm_model = init_llm_model(
                     model_name=model_name,
@@ -395,23 +484,16 @@ class LLMRails:
                     kwargs=kwargs,
                 )
 
-                if self.config.streaming:
-                    if "streaming" in llm_model.model_fields:
-                        llm_model.streaming = True
-                        self.main_llm_supports_streaming = True
-                    else:
-                        log.warning(
-                            "Model %s from provider %s does not support streaming.",
-                            model_name,
-                            provider_name,
-                        )
-
-                if llm_config.type == "main" or len(self.config.models) == 1:
-                    self.llm = llm_model
-                    self.runtime.register_action_param("llm", self.llm)
+                if llm_config.type == "main":
+                    # If a main LLM was already injected, skip creating another
+                    # one. Otherwise, create and register it.
+                    if not self.llm:
+                        self.llm = llm_model
+                        self.runtime.register_action_param("llm", self.llm)
                 else:
                     model_name = f"{llm_config.type}_llm"
-                    setattr(self, model_name, llm_model)
+                    if not hasattr(self, model_name):
+                        setattr(self, model_name, llm_model)
                     self.runtime.register_action_param(
                         model_name, getattr(self, model_name)
                     )
@@ -426,6 +508,147 @@ class LLMRails:
                 raise
 
         self.runtime.register_action_param("llms", llms)
+
+    def _create_isolated_llms_for_actions(self):
+        """Create isolated LLM copies for all actions that accept 'llm' parameter."""
+        if not self.llm:
+            log.debug("No main LLM available for creating isolated copies")
+            return
+
+        try:
+            actions_needing_llms = self._detect_llm_requiring_actions()
+            log.info(
+                "%d actions requiring isolated LLMs: %s",
+                len(actions_needing_llms),
+                list(actions_needing_llms),
+            )
+
+            created_count = 0
+
+            configured_actions_names = []
+            try:
+                if self.config.flows:
+                    get_action_details = partial(
+                        get_action_details_from_flow_id, flows=self.config.flows
+                    )
+                    for flow_id in self.config.rails.input.flows:
+                        action_name, _ = get_action_details(flow_id)
+                        configured_actions_names.append(action_name)
+                    for flow_id in self.config.rails.output.flows:
+                        action_name, _ = get_action_details(flow_id)
+                        configured_actions_names.append(action_name)
+                else:
+                    # for configurations without flow definitions, use all actions that need LLMs
+                    log.info(
+                        "No flow definitions found, creating isolated LLMs for all actions requiring them"
+                    )
+                    configured_actions_names = list(actions_needing_llms)
+            except Exception as e:
+                # if flow matching fails, fall back to all actions that need LLMs
+                log.info(
+                    "Flow matching failed (%s), creating isolated LLMs for all actions requiring them",
+                    e,
+                )
+                configured_actions_names = list(actions_needing_llms)
+
+            for action_name in configured_actions_names:
+                if action_name not in actions_needing_llms:
+                    continue
+                if f"{action_name}_llm" not in self.runtime.registered_action_params:
+                    isolated_llm = self._create_action_llm_copy(self.llm, action_name)
+                    if isolated_llm:
+                        self.runtime.register_action_param(
+                            f"{action_name}_llm", isolated_llm
+                        )
+                        created_count += 1
+                        log.debug("Created isolated LLM for action: %s", action_name)
+                else:
+                    log.debug(
+                        "Action %s already has dedicated LLM, skipping isolation",
+                        action_name,
+                    )
+
+            log.info("Created %d isolated LLM instances for actions", created_count)
+
+        except Exception as e:
+            log.warning("Failed to create isolated LLMs for actions: %s", e)
+
+    def _detect_llm_requiring_actions(self):
+        """Auto-detect actions that have 'llm' parameter."""
+        import inspect
+
+        actions_needing_llms = set()
+
+        if (
+            not hasattr(self.runtime, "action_dispatcher")
+            or not self.runtime.action_dispatcher
+        ):
+            log.debug("Action dispatcher not available")
+            return actions_needing_llms
+
+        for (
+            action_name,
+            action_info,
+        ) in self.runtime.action_dispatcher.registered_actions.items():
+            action_func = self._get_action_function(action_info)
+            if not action_func:
+                continue
+
+            try:
+                sig = inspect.signature(action_func)
+                if "llm" in sig.parameters:
+                    actions_needing_llms.add(action_name)
+                    log.debug("Action %s has 'llm' parameter", action_name)
+
+            except Exception as e:
+                log.debug("Could not inspect action %s: %s", action_name, e)
+
+        return actions_needing_llms
+
+    def _get_action_function(self, action_info):
+        """Extract the actual function from action info."""
+        return action_info if callable(action_info) else None
+
+    def _create_action_llm_copy(
+        self, main_llm: Union[BaseLLM, BaseChatModel], action_name: str
+    ) -> Optional[Union[BaseLLM, BaseChatModel]]:
+        """Create an isolated copy of main LLM for a specific action."""
+        import copy
+
+        try:
+            # shallow copy to preserve HTTP clients, credentials, etc.
+            # but create new instance to avoid shared state
+            isolated_llm = copy.copy(main_llm)
+
+            # isolate model_kwargs to prevent shared mutable state
+            if (
+                hasattr(isolated_llm, "model_kwargs")
+                and isolated_llm.model_kwargs is not None
+            ):
+                isolated_llm.model_kwargs = isolated_llm.model_kwargs.copy()
+
+            log.debug(
+                "Successfully created isolated LLM copy for action: %s", action_name
+            )
+            return isolated_llm
+
+        except Exception as e:
+            error_msg = (
+                "Failed to create isolated LLM instance for action '%s'. "
+                "This is required to prevent parameter contamination between different actions. "
+                "\n\nPossible solutions:"
+                "\n1. If using a custom LLM class, ensure it supports copy.copy() operation"
+                "\n2. Check that your LLM configuration doesn't contain non-copyable objects"
+                "\n3. Consider using a dedicated LLM configuration for action '%s'"
+                "\n\nOriginal error: %s"
+                "\n\nTo use a dedicated LLM for this action, add to your config:"
+                "\nmodels:"
+                "\n  - type: %s"
+                "\n    engine: <your_engine>"
+                "\n    model: <your_model>"
+            ) % (action_name, action_name, e, action_name)
+            log.error(error_msg)
+            raise RuntimeError(error_msg)
 
     def _get_embeddings_search_provider_instance(
         self, esp_config: Optional[EmbeddingSearchProvider] = None
@@ -539,6 +762,9 @@ class LLMRails:
                     events.append({"type": "ContextUpdate", "data": msg["content"]})
                 elif msg["role"] == "event":
                     events.append(msg["event"])
+                elif msg["role"] == "system":
+                    # Handle system messages - convert them to SystemMessage events
+                    events.append({"type": "SystemMessage", "content": msg["content"]})
         else:
             for idx in range(len(messages)):
                 msg = messages[idx]
@@ -558,6 +784,9 @@ class LLMRails:
                     events.append({"type": "ContextUpdate", "data": msg["content"]})
                 elif msg["role"] == "event":
                     events.append(msg["event"])
+                elif msg["role"] == "system":
+                    # Handle system messages - convert them to SystemMessage events
+                    events.append({"type": "SystemMessage", "content": msg["content"]})
                 elif msg["role"] == "tool":
                     action_uid = msg["tool_call_id"]
                     return_value = msg["content"]
@@ -575,6 +804,20 @@ class LLMRails:
                     )
 
         return events
+
+    @staticmethod
+    def _ensure_explain_info() -> ExplainInfo:
+        """Ensure that the ExplainInfo variable is present in the current context
+
+        Returns:
+            A ExplainInfo class containing the llm calls' statistics
+        """
+        explain_info = explain_info_var.get()
+        if explain_info is None:
+            explain_info = ExplainInfo()
+            explain_info_var.set(explain_info)
+
+        return explain_info
 
     async def generate_async(
         self,
@@ -634,14 +877,7 @@ class LLMRails:
         # Initialize the object with additional explanation information.
         # We allow this to also be set externally. This is useful when multiple parallel
         # requests are made.
-        explain_info = explain_info_var.get()
-        if explain_info is None:
-            explain_info = ExplainInfo()
-            explain_info_var.set(explain_info)
-
-            # We also keep a general reference to this object
-            self.explain_info = explain_info
-        self.explain_info = explain_info
+        self.explain_info = self._ensure_explain_info()
 
         if prompt is not None:
             # Currently, we transform the prompt request into a single turn conversation
@@ -706,7 +942,7 @@ class LLMRails:
                     error_payload = json.dumps(error_dict)
                     await streaming_handler.push_chunk(error_payload)
                     # push a termination signal
-                    await streaming_handler.push_chunk(None)
+                    await streaming_handler.push_chunk(END_OF_STREAM)
                 # Re-raise the exact exception
                 raise
         else:
@@ -805,9 +1041,11 @@ class LLMRails:
 
         # If logging is enabled, we log the conversation
         # TODO: add support for logging flag
-        explain_info.colang_history = get_colang_history(events)
+        self.explain_info.colang_history = get_colang_history(events)
         if self.verbose:
-            log.info(f"Conversation history so far: \n{explain_info.colang_history}")
+            log.info(
+                f"Conversation history so far: \n{self.explain_info.colang_history}"
+            )
 
         total_time = time.time() - t0
         log.info(
@@ -819,12 +1057,24 @@ class LLMRails:
         streaming_handler = streaming_handler_var.get()
         if streaming_handler:
             # print("Closing the stream handler explicitly")
-            await streaming_handler.push_chunk(None)
+            await streaming_handler.push_chunk(END_OF_STREAM)
 
         # IF tracing is enabled we need to set GenerationLog attrs
+        original_log_options = None
         if self.config.tracing.enabled:
             if options is None:
                 options = GenerationOptions()
+            else:
+                # create a copy of the options to avoid modifying the original
+                if isinstance(options, GenerationOptions):
+                    options = options.model_copy(deep=True)
+                else:
+                    # If options is a dict, convert it to GenerationOptions
+                    options = GenerationOptions(**options)
+            original_log_options = options.log.model_copy(deep=True)
+
+            # enable log options
+            # it is aggressive, but these are required for tracing
             if (
                 not options.log.activated_rails
                 or not options.log.llm_calls
@@ -933,11 +1183,40 @@ class LLMRails:
                 # lazy import to avoid circular dependency
                 from nemoguardrails.tracing import Tracer
 
-                # Create a Tracer instance with instantiated adapters
+                span_format = getattr(
+                    self.config.tracing, "span_format", "opentelemetry"
+                )
+                enable_content_capture = getattr(
+                    self.config.tracing, "enable_content_capture", False
+                )
+                # Create a Tracer instance with instantiated adapters and span configuration
                 tracer = Tracer(
-                    input=messages, response=res, adapters=self._log_adapters
+                    input=messages,
+                    response=res,
+                    adapters=self._log_adapters,
+                    span_format=span_format,
+                    enable_content_capture=enable_content_capture,
                 )
                 await tracer.export_async()
+
+                # respect original log specification, if tracing added information to the output
+                if original_log_options:
+                    if not any(
+                        (
+                            original_log_options.internal_events,
+                            original_log_options.activated_rails,
+                            original_log_options.llm_calls,
+                            original_log_options.colang_history,
+                        )
+                    ):
+                        res.log = None
+                    else:
+                        if not original_log_options.internal_events:
+                            res.log.internal_events = []
+                        if not original_log_options.activated_rails:
+                            res.log.activated_rails = []
+                        if not original_log_options.llm_calls:
+                            res.log.llm_calls = []
 
             return res
         else:
@@ -958,23 +1237,60 @@ class LLMRails:
         options: Optional[Union[dict, GenerationOptions]] = None,
         state: Optional[Union[dict, State]] = None,
         include_generation_metadata: Optional[bool] = False,
+        generator: Optional[AsyncIterator[str]] = None,
     ) -> AsyncIterator[str]:
         """Simplified interface for getting directly the streamed tokens from the LLM."""
+
+        # if an external generator is provided, use it directly
+        if generator:
+            if self.config.rails.output.streaming.enabled:
+                return self._run_output_rails_in_streaming(
+                    streaming_handler=generator,
+                    messages=messages,
+                    prompt=prompt,
+                )
+            else:
+                return generator
+
+        self.explain_info = self._ensure_explain_info()
+
         streaming_handler = StreamingHandler(
             include_generation_metadata=include_generation_metadata
         )
 
-        # todo use a context var for buffer strategy and return it here?
-        # then iterating over buffer strategy is nested loop?
-        asyncio.create_task(
-            self.generate_async(
-                prompt=prompt,
-                messages=messages,
-                streaming_handler=streaming_handler,
-                options=options,
-                state=state,
-            )
-        )
+        # Create a properly managed task with exception handling
+        async def _generation_task():
+            try:
+                await self.generate_async(
+                    prompt=prompt,
+                    messages=messages,
+                    streaming_handler=streaming_handler,
+                    options=options,
+                    state=state,
+                )
+            except Exception as e:
+                # If an exception occurs during generation, push it to the streaming handler as a json string
+                # This ensures the streaming pipeline is properly terminated
+                log.error(f"Error in generation task: {e}", exc_info=True)
+                error_message = str(e)
+                error_dict = extract_error_json(error_message)
+                error_payload = json.dumps(error_dict)
+                await streaming_handler.push_chunk(error_payload)
+                await streaming_handler.push_chunk(END_OF_STREAM)
+
+        task = asyncio.create_task(_generation_task())
+
+        # Store task reference to prevent garbage collection and ensure proper cleanup
+        if not hasattr(self, "_active_tasks"):
+            self._active_tasks = set()
+        self._active_tasks.add(task)
+
+        # Clean up task when it's done
+        def task_done_callback(task):
+            self._active_tasks.discard(task)
+
+        task.add_done_callback(task_done_callback)
+
         # when we have output rails we wrap the streaming handler
         # if len(self.config.rails.output.flows) > 0:
         #
@@ -1133,33 +1449,38 @@ class LLMRails:
             self.process_events_async(events, state, blocking)
         )
 
-    def register_action(self, action: callable, name: Optional[str] = None):
+    def register_action(self, action: callable, name: Optional[str] = None) -> Self:
         """Register a custom action for the rails configuration."""
         self.runtime.register_action(action, name)
+        return self
 
-    def register_action_param(self, name: str, value: Any):
+    def register_action_param(self, name: str, value: Any) -> Self:
         """Registers a custom action parameter."""
         self.runtime.register_action_param(name, value)
+        return self
 
-    def register_filter(self, filter_fn: callable, name: Optional[str] = None):
+    def register_filter(self, filter_fn: callable, name: Optional[str] = None) -> Self:
         """Register a custom filter for the rails configuration."""
         self.runtime.llm_task_manager.register_filter(filter_fn, name)
+        return self
 
-    def register_output_parser(self, output_parser: callable, name: str):
+    def register_output_parser(self, output_parser: callable, name: str) -> Self:
         """Register a custom output parser for the rails configuration."""
         self.runtime.llm_task_manager.register_output_parser(output_parser, name)
+        return self
 
-    def register_prompt_context(self, name: str, value_or_fn: Any):
+    def register_prompt_context(self, name: str, value_or_fn: Any) -> Self:
         """Register a value to be included in the prompt context.
 
         :name: The name of the variable or function that will be used.
         :value_or_fn: The value or function that will be used to generate the value.
         """
         self.runtime.llm_task_manager.register_prompt_context(name, value_or_fn)
+        return self
 
     def register_embedding_search_provider(
         self, name: str, cls: Type[EmbeddingsIndex]
-    ) -> None:
+    ) -> Self:
         """Register a new embedding search provider.
 
         Args:
@@ -1168,10 +1489,11 @@ class LLMRails:
         """
 
         self.embedding_search_providers[name] = cls
+        return self
 
     def register_embedding_provider(
         self, cls: Type[EmbeddingModel], name: Optional[str] = None
-    ) -> None:
+    ) -> Self:
         """Register a custom embedding provider.
 
         Args:
@@ -1183,6 +1505,7 @@ class LLMRails:
             ValueError: If the model does not have 'encode' or 'encode_async' methods.
         """
         register_embedding_provider(engine_name=name, model=cls)
+        return self
 
     def explain(self) -> ExplainInfo:
         """Helper function to return the latest ExplainInfo object."""
@@ -1232,10 +1555,36 @@ class LLMRails:
                     return message
             return {}
 
+        def _prepare_context_for_parallel_rails(
+            chunk_str: str,
+            prompt: Optional[str] = None,
+            messages: Optional[List[dict]] = None,
+        ) -> dict:
+            """Prepare context for parallel rails execution."""
+            context_message = _get_last_context_message(messages)
+            user_message = prompt or _get_latest_user_message(messages)
+
+            context = {
+                "user_message": user_message,
+                "bot_message": chunk_str,
+            }
+
+            if context_message:
+                context.update(context_message["content"])
+
+            return context
+
+        def _create_events_for_chunk(chunk_str: str, context: dict) -> List[dict]:
+            """Create events for running output rails on a chunk."""
+            return [
+                {"type": "ContextUpdate", "data": context},
+                {"type": "BotMessage", "text": chunk_str},
+            ]
+
         def _prepare_params(
             flow_id: str,
             action_name: str,
-            chunk_str: str,
+            bot_response_chunk: str,
             prompt: Optional[str] = None,
             messages: Optional[List[dict]] = None,
             action_params: Dict[str, Any] = {},
@@ -1245,7 +1594,7 @@ class LLMRails:
 
             context = {
                 "user_message": user_message,
-                "bot_message": chunk_str,
+                "bot_message": bot_response_chunk,
             }
 
             if context_message:
@@ -1258,14 +1607,13 @@ class LLMRails:
             # to resolve replace placeholders in action_params
             for key, value in action_params.items():
                 if value == "$bot_message":
-                    action_params[key] = chunk_str
+                    action_params[key] = bot_response_chunk
                 elif value == "$user_message":
                     action_params[key] = user_message
 
             return {
                 # TODO:: are there other context variables that need to be passed?
                 # passing events to compute context was not successful
-                # self._events failed
                 # context var failed due to different context
                 "context": context,
                 "llm_task_manager": self.runtime.llm_task_manager,
@@ -1278,144 +1626,164 @@ class LLMRails:
                 **action_params,
             }
 
-        def _update_explain_info():
-            explain_info = explain_info_var.get()
-            if explain_info is None:
-                explain_info = ExplainInfo()
-                explain_info_var.set(explain_info)
-                self.explain_info = explain_info
-
         output_rails_streaming_config = self.config.rails.output.streaming
         buffer_strategy = get_buffer_strategy(output_rails_streaming_config)
         output_rails_flows_id = self.config.rails.output.flows
         stream_first = stream_first or output_rails_streaming_config.stream_first
         get_action_details = partial(
-            _get_action_details_from_flow_id, flows=self.config.flows
+            get_action_details_from_flow_id, flows=self.config.flows
         )
 
-        async for chunk_list, chunk_str_rep in buffer_strategy(streaming_handler):
-            chunk_str = " ".join(chunk_list)
+        parallel_mode = getattr(self.config.rails.output, "parallel", False)
 
-            # Check if chunk_str_rep is a JSON string
-            # we yield a json error payload in generate_async when
-            # streaming has errors
-            try:
-                json.loads(chunk_str_rep)
-                yield chunk_str_rep
-                return
-            except json.JSONDecodeError:
-                pass
-            if stream_first:
-                words = chunk_str_rep.split()
-                if words:
-                    yield words[0]
-                    for word in words[1:]:
-                        yield f" {word}"
+        async for chunk_batch in buffer_strategy(streaming_handler):
+            user_output_chunks = chunk_batch.user_output_chunks
+            # format processing_context for output rails processing (needs full context)
+            bot_response_chunk = buffer_strategy.format_chunks(
+                chunk_batch.processing_context
+            )
 
-            for flow_id in output_rails_flows_id:
-                action_name, action_params = get_action_details(flow_id)
-
-                params = _prepare_params(
-                    flow_id=flow_id,
-                    action_name=action_name,
-                    chunk_str=chunk_str,
-                    prompt=prompt,
-                    messages=messages,
-                    action_params=action_params,
-                )
-
-                # Execute the action. (Your execute_action returns only the result.)
-                result = await self.runtime.action_dispatcher.execute_action(
-                    action_name, params
-                )
-                # Include explain info (whatever _update_explain_info does)
-                _update_explain_info()
-
-                # Retrieve the action function from the dispatcher
-                action_func = self.runtime.action_dispatcher.get_action(action_name)
-
-                # Use the mapping to decide if the result indicates blocked content.
-                if is_output_blocked(result, action_func):
-                    reason = f"Blocked by {flow_id} rails."
-
-                    # return the error as a plain JSON string (not in SSE format)
-                    # NOTE: When integrating with the OpenAI Python client, the server code should:
-                    # 1. detect this JSON error object in the stream
-                    # 2. terminate the stream
-                    # 3. format the error following OpenAI's SSE format
-                    # the OpenAI client will then properly raise an APIError with this error message
-
-                    error_data = {
-                        "error": {
-                            "message": reason,
-                            "type": "guardrails_violation",
-                            "param": flow_id,
-                            "code": "content_blocked",
-                        }
-                    }
-
-                    # return as plain JSON: the server should detect this JSON and convert it to an HTTP error
-                    yield json.dumps(error_data)
+            # check if user_output_chunks is a list of individual chunks
+            # or if it's a JSON string, by convention this means an error occurred and the error dict is stored as a JSON
+            if not isinstance(user_output_chunks, list):
+                try:
+                    json.loads(user_output_chunks)
+                    yield user_output_chunks
                     return
+                except (json.JSONDecodeError, TypeError):
+                    # if it's not JSON, treat it as empty list
+                    user_output_chunks = []
+
+            if stream_first:
+                # yield the individual chunks directly from the buffer strategy
+                for chunk in user_output_chunks:
+                    yield chunk
+
+            if parallel_mode:
+                try:
+                    context = _prepare_context_for_parallel_rails(
+                        bot_response_chunk, prompt, messages
+                    )
+                    events = _create_events_for_chunk(bot_response_chunk, context)
+
+                    flows_with_params = {}
+                    for flow_id in output_rails_flows_id:
+                        action_name, action_params = get_action_details(flow_id)
+                        params = _prepare_params(
+                            flow_id=flow_id,
+                            action_name=action_name,
+                            bot_response_chunk=bot_response_chunk,
+                            prompt=prompt,
+                            messages=messages,
+                            action_params=action_params,
+                        )
+                        flows_with_params[flow_id] = {
+                            "action_name": action_name,
+                            "params": params,
+                        }
+
+                    result_tuple = await self.runtime.action_dispatcher.execute_action(
+                        "run_output_rails_in_parallel_streaming",
+                        {
+                            "flows_with_params": flows_with_params,
+                            "events": events,
+                        },
+                    )
+
+                    # ActionDispatcher.execute_action always returns (result, status)
+                    result, status = result_tuple
+
+                    if status != "success":
+                        log.error(
+                            f"Parallel rails execution failed with status: {status}"
+                        )
+                        # continue processing the chunk even if rails fail
+                        pass
+                    else:
+                        # if there are any stop events, content was blocked or internal error occurred
+                        if result.events:
+                            # extract the flow info from the first stop event
+                            stop_event = result.events[0]
+                            blocked_flow = stop_event.get("flow_id", "output rails")
+                            error_type = stop_event.get("error_type")
+
+                            if error_type == "internal_error":
+                                error_message = stop_event.get(
+                                    "error_message", "Unknown error"
+                                )
+                                reason = f"Internal error in {blocked_flow} rail: {error_message}"
+                                error_code = "rail_execution_failure"
+                                error_type = "internal_error"
+                            else:
+                                reason = f"Blocked by {blocked_flow} rails."
+                                error_code = "content_blocked"
+                                error_type = "guardrails_violation"
+
+                            error_data = {
+                                "error": {
+                                    "message": reason,
+                                    "type": error_type,
+                                    "param": blocked_flow,
+                                    "code": error_code,
+                                }
+                            }
+                            yield json.dumps(error_data)
+                            return
+
+                except Exception as e:
+                    log.error(f"Error in parallel rail execution: {e}")
+                    # don't block the stream for rail execution errors
+                    # continue processing the chunk
+                    pass
+
+                # update explain info for parallel mode
+                self.explain_info = self._ensure_explain_info()
+
+            else:
+                for flow_id in output_rails_flows_id:
+                    action_name, action_params = get_action_details(flow_id)
+
+                    params = _prepare_params(
+                        flow_id=flow_id,
+                        action_name=action_name,
+                        bot_response_chunk=bot_response_chunk,
+                        prompt=prompt,
+                        messages=messages,
+                        action_params=action_params,
+                    )
+
+                    result = await self.runtime.action_dispatcher.execute_action(
+                        action_name, params
+                    )
+                    self.explain_info = self._ensure_explain_info()
+
+                    action_func = self.runtime.action_dispatcher.get_action(action_name)
+
+                    # Use the mapping to decide if the result indicates blocked content.
+                    if is_output_blocked(result, action_func):
+                        reason = f"Blocked by {flow_id} rails."
+
+                        # return the error as a plain JSON string (not in SSE format)
+                        # NOTE: When integrating with the OpenAI Python client, the server code should:
+                        # 1. detect this JSON error object in the stream
+                        # 2. terminate the stream
+                        # 3. format the error following OpenAI's SSE format
+                        # the OpenAI client will then properly raise an APIError with this error message
+
+                        error_data = {
+                            "error": {
+                                "message": reason,
+                                "type": "guardrails_violation",
+                                "param": flow_id,
+                                "code": "content_blocked",
+                            }
+                        }
+
+                        # return as plain JSON: the server should detect this JSON and convert it to an HTTP error
+                        yield json.dumps(error_data)
+                        return
 
             if not stream_first:
-                words = chunk_str_rep.split()
-                if words:
-                    yield words[0]
-                    for word in words[1:]:
-                        yield f" {word}"
-
-
-def _get_action_details_from_flow_id(
-    flow_id: str,
-    flows: List[Union[Dict, Any]],
-    prefixes: Optional[List[str]] = None,
-) -> Tuple[str, Any]:
-    """Get the action name and parameters from the flow id.
-
-    First, try to find an exact match.
-    If not found, then if the provided flow_id starts with one of the special prefixes,
-    return the first flow whose id starts with that same prefix.
-    """
-
-    supported_prefixes = [
-        "content safety check output",
-        "topic safety check output",
-    ]
-    if prefixes:
-        supported_prefixes.extend(prefixes)
-
-    candidate_flow = None
-
-    for flow in flows:
-        # If exact match, use it
-        if flow["id"] == flow_id:
-            candidate_flow = flow
-            break
-
-        # If no exact match, check if both the provided flow_id and this flow's id share a special prefix
-        for prefix in supported_prefixes:
-            if flow_id.startswith(prefix) and flow["id"].startswith(prefix):
-                candidate_flow = flow
-                # We don't break immediately here because an exact match would have been preferred,
-                # but since we're in the else branch it's fine to choose the first matching candidate.
-                # TODO:we should avoid having multiple matchin prefixes
-                break
-
-        if candidate_flow is not None:
-            break
-
-    if candidate_flow is None:
-        raise ValueError(f"No action found for flow_id: {flow_id}")
-
-    # we have identified a candidate, look for the run_action element.
-    for element in candidate_flow["elements"]:
-        if (
-            element["_type"] == "run_action"
-            and element["_source_mapping"]["filename"].endswith(".co")
-            and "execute" in element["_source_mapping"]["line_text"]
-            and "action_name" in element
-        ):
-            return element["action_name"], element["action_params"]
-
-    raise ValueError(f"No run_action element found for flow_id: {flow_id}")
+                # yield the individual chunks directly from the buffer strategy
+                for chunk in user_output_chunks:
+                    yield chunk

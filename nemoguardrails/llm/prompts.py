@@ -14,8 +14,9 @@
 # limitations under the License.
 
 """Prompts for the various steps in the interaction."""
+
 import os
-from typing import List, Union
+from typing import List, Optional, Union
 
 import yaml
 
@@ -77,24 +78,35 @@ def _get_prompt(
             _score = 0.2
         else:
             for _model in prompt.models:
-                # If we have an exact match, the score is 1.
+                # If we have an exact match for the full task_model string (e.g., "engine/provider/model-variant")
                 if _model == model:
                     _score = 1
                     break
 
-                # If we match just the provider, the score is 0.5.
+                # is a provider/base_model pattern matching the model path component of `model` (task_model string).
+                parts = model.split("/", 1)
+                config_model_path = parts[1] if len(parts) > 1 else parts[0]
+
+                if "/" in _model and config_model_path.startswith(_model):
+                    if _model == config_model_path:
+                        # _model exactly matches the model path component (e.g., "nvidia/llama-3.1-nemotron-ultra-253b-v1")
+                        _score = 0.8
+                    else:
+                        # _model is a proper prefix (e.g., "nvidia/llama-3.1-nemotron" for "...-ultra-253b-v1")
+                        _score = 0.9
+                    break
+
                 elif model.startswith(_model + "/"):
                     _score = 0.5
                     break
 
-                # If we match just the model, the score is 0.8.
                 elif model.endswith("/" + _model):
                     _score = 0.8
                     break
 
-                # If we match a substring, the score is 0.4
                 elif _model in model:
                     _score = 0.4
+                    break
 
         if prompt.mode != prompting_mode:
             # Penalize matching score for being in an incorrect mode.
@@ -117,17 +129,29 @@ def _get_prompt(
     raise ValueError(f"Could not find prompt for task {task_name} and model {model}")
 
 
-def get_task_model(config: RailsConfig, task: Union[str, Task]) -> Model:
+def get_task_model(config: RailsConfig, task: Union[str, Task]) -> Optional[Model]:
     """Return the model for the given task in the current config."""
     # Fetch current task parameters like name, models to use, and the prompting mode
     task_name = str(task.value) if isinstance(task, Task) else task
 
+    # Check if the task name contains a model specification (e.g., "content_safety_check_input $model=content_safety")
+    if "$model=" in task_name:
+        # Extract the model type from the task name
+        model_type = task_name.split("$model=")[-1].strip()
+        # Look for a model with this specific type
+        if config.models:
+            _models = [model for model in config.models if model.type == model_type]
+            if _models:
+                return _models[0]
+
+    # If no model specification or no matching model found, fall back to the original logic
     if config.models:
         _models = [model for model in config.models if model.type == task_name]
         if not _models:
             _models = [model for model in config.models if model.type == "main"]
 
-        return _models[0]
+        if _models:
+            return _models[0]
 
     return None
 
